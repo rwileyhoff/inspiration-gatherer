@@ -1,0 +1,7 @@
+streamlit
+pandas
+openpyxl
+curl_cffi
+Pillow
+python-pptx
+beautifulsoup4
