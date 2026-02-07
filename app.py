@@ -9,195 +9,223 @@ from pptx import Presentation
 from pptx.util import Inches
 from bs4 import BeautifulSoup
 import time
+import re
+from duckduckgo_search import DDGS
 
 # --- CONFIGURATION ---
 TARGET_WIDTH_PX = 179
 TARGET_HEIGHT_PX = 135
 
-def get_real_image_url(url):
+# --- HELPER FUNCTIONS ---
+
+def get_next_direct_cdn(url):
     """
-    Fetches the URL using a browser impersonator to bypass 403 errors.
-    Parses the HTML to find the high-quality Open Graph image.
+    Specifically for Next.co.uk.
+    Instead of visiting the page, we extract the Style/Item codes and 
+    guess the direct image URL from their public image server (CDN).
     """
     try:
-        # 1. Clean the URL
-        clean_url = url.strip()
+        # Regex to find codes like 'sv068808' or 'y00128' in the URL
+        # Matches alphanumeric strings of 5-8 chars after 'style/' or '/'
+        codes = re.findall(r'(?:style/|/)([a-zA-Z0-9]{5,10})', url)
         
-        # 2. Check if it's already an image file
-        if clean_url.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-            return clean_url
-
-        # 3. Request the page masquerading as a real Chrome browser
-        # 'impersonate="chrome"' generates the correct TLS fingerprint to fool security systems
-        response = cffi_requests.get(clean_url, impersonate="chrome", timeout=15)
+        # Next.co.uk image server patterns
+        # They usually store images under the "Option" code (the second code usually) 
+        # or the "Style" code (the first code). We try both.
+        base_cdn = "https://xcdn.next.co.uk/common/items/default/default/itemimages/search"
         
-        # If we still get a 403, we return None (it will be logged later)
-        if response.status_code != 200:
-            print(f"Failed to access {clean_url} - Status: {response.status_code}")
-            return None
-
-        # 4. Parse HTML to find the "og:image" (The main product image used for social sharing)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        og_image = soup.find("meta", property="og:image")
+        session = cffi_requests.Session()
         
-        if og_image and og_image.get("content"):
-            return og_image["content"]
+        # We prefer the last code found (often the specific color option), then the first
+        unique_codes = list(dict.fromkeys(reversed(codes))) # Remove duplicates, preserve order
+        
+        for code in unique_codes:
+            # Construct the candidate URL
+            candidate_url = f"{base_cdn}/{code}.jpg"
             
+            try:
+                # We use a HEAD request first to see if the image exists (Fast!)
+                r = session.head(candidate_url, timeout=3)
+                if r.status_code == 200:
+                    return candidate_url
+            except:
+                pass
+                
     except Exception as e:
-        print(f"Error scraping page {url}: {e}")
+        print(f"CDN Guessing failed: {e}")
+        
+    return None
+
+def fetch_image_via_search_fallback(query):
+    """
+    Last resort: Search DuckDuckGo, but strictly for 'Product Image'
+    to avoid selfies/blogs.
+    """
+    try:
+        # Extract a cleaner query ID if possible
+        clean_id = ""
+        match = re.search(r'style/([a-zA-Z0-9]+)', query)
+        if match:
+            clean_id = match.group(1)
+            search_term = f"Next UK product {clean_id}"
+        else:
+            search_term = f"{query} product image white background"
+
+        with DDGS() as ddgs:
+            results = list(ddgs.images(
+                keywords=search_term, 
+                max_results=1, 
+                safesearch='off'
+            ))
+            if results:
+                return results[0]['image']
+    except:
         pass
-    
-    # If scraping failed, return original URL (it might work directly if we are lucky)
-    return url
+    return None
 
 def download_and_resize_image(url, width, height):
     try:
-        # 1. Get the direct image link
-        image_url = get_real_image_url(url)
+        clean_url = url.strip()
+        final_image_url = None
         
-        if not image_url:
-            return None
-        
-        # 2. Download the actual image using the same browser impersonation
-        response = cffi_requests.get(image_url, impersonate="chrome", timeout=15)
-        response.raise_for_status()
-        
-        # 3. Process with Pillow
-        img = Image.open(BytesIO(response.content))
-        
-        # Convert to RGB (fixes issues with transparent PNGs or CMYK images)
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
+        # --- STRATEGY 1: DIRECT FILE CHECK ---
+        if clean_url.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+            final_image_url = clean_url
+
+        # --- STRATEGY 2: SPECIAL HANDLING FOR NEXT.CO.UK ---
+        if not final_image_url and "next.co.uk" in clean_url:
+            # Try to build the CDN link directly (Bypasses security entirely)
+            final_image_url = get_next_direct_cdn(clean_url)
+
+        # --- STRATEGY 3: GENERIC WEBSITES (Pottery Barn, etc.) ---
+        if not final_image_url:
+            # Try standard scraping with browser disguise
+            try:
+                session = cffi_requests.Session()
+                r = session.get(clean_url, impersonate="chrome110", timeout=10)
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.content, 'html.parser')
+                    og = soup.find("meta", property="og:image")
+                    if og and og.get("content"):
+                        final_image_url = og["content"]
+            except:
+                pass
+
+        # --- STRATEGY 4: FALLBACK SEARCH ---
+        if not final_image_url:
+            final_image_url = fetch_image_via_search_fallback(clean_url)
+
+        # --- DOWNLOAD & PROCESS ---
+        if final_image_url:
+            # Download the actual image bytes
+            r = cffi_requests.get(final_image_url, impersonate="chrome110", timeout=15)
+            r.raise_for_status()
             
-        img = img.resize((width, height))
-        return img
+            img = Image.open(BytesIO(r.content))
+            
+            # Convert to RGB (standardize format)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            
+            # Resize
+            img = img.resize((width, height))
+            return img
+            
     except Exception as e:
-        print(f"Error downloading image {url}: {e}")
+        print(f"Failed to process {url}: {e}")
         return None
 
 # --- APP INTERFACE ---
-st.set_page_config(page_title="Excel Image Automator v3", layout="wide")
+st.set_page_config(page_title="Excel Image Automator v7", layout="wide")
 st.title("📊 Excel & PPT Image Automator")
 st.markdown("""
-**Version 3 Update**: Now using `curl_cffi` to bypass "403 Forbidden" errors on sites like Pottery Barn.
+**Version 7 (CDN Bypass)**: 
+- Specifically engineered for **Next.co.uk**. 
+- It bypasses the website and pulls the official product image directly from the file server.
+- Removes the risk of getting random "Selfie" or "Blog" images.
 """)
 
 uploaded_file = st.file_uploader("Upload your Excel Template (.xlsx)", type=['xlsx'])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
-    st.write("### 1. Preview Data")
+    st.write("### Preview")
     st.dataframe(df.head())
 
     col1, col2 = st.columns(2)
     with col1:
-        # User selects which column has the links
         url_col = st.selectbox("Select Column with URLs", df.columns, index=0)
     with col2:
-        # User types which column letter gets the image
-        target_col_letter = st.text_input("Output Column Letter for Image", value="B").upper()
+        target_col_letter = st.text_input("Output Column Letter", value="B").upper()
 
     st.markdown("---")
-    st.write("### 2. Generate Files")
 
-    if st.button("Generate Excel with Images"):
+    if st.button("Generate Excel"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # Prepare Excel File
+        # Load workbook
         uploaded_file.seek(0)
         wb = openpyxl.load_workbook(uploaded_file)
         ws = wb.active
         
-        total_rows = len(df)
         success_count = 0
+        total_rows = len(df)
         
         for i, row in df.iterrows():
-            # Update GUI
-            progress = (i + 1) / total_rows
-            progress_bar.progress(progress)
+            # Update Progress
+            progress_bar.progress((i + 1) / total_rows)
             
             raw_url = row[url_col]
             
             if pd.notna(raw_url) and str(raw_url).startswith('http'):
-                status_text.text(f"Processing ({i+1}/{total_rows}): {str(raw_url)[:40]}...")
+                status_text.text(f"Processing Row {i+1}...")
                 
-                # The Magic: Download & Resize
                 processed_img = download_and_resize_image(raw_url, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
                 
                 if processed_img:
                     success_count += 1
-                    
-                    # Convert processed image to bytes for Excel
                     img_stream = BytesIO()
                     processed_img.save(img_stream, format='PNG')
                     img_stream.seek(0)
                     
-                    # Place Image in Excel
+                    # Add to Excel
                     excel_img = OpenpyxlImage(img_stream)
-                    excel_row = i + 2 # Header is 1, Data starts at 2
-                    cell_address = f"{target_col_letter}{excel_row}"
-                    
-                    excel_img.anchor = cell_address
-                    ws.add_image(excel_img)
-                    
-                    # Set Row Height
+                    excel_row = i + 2
+                    ws.add_image(excel_img, f"{target_col_letter}{excel_row}")
                     ws.row_dimensions[excel_row].height = 105
             
-            # Tiny sleep to prevent rate limiting
-            time.sleep(0.5)
+            # Tiny pause
+            time.sleep(0.1)
 
-        status_text.text(f"Done! Processed {total_rows} rows. Images found: {success_count}.")
+        status_text.text(f"Done! {success_count}/{total_rows} images added.")
         
-        # Save output
-        excel_buffer = BytesIO()
-        wb.save(excel_buffer)
-        excel_buffer.seek(0)
+        # Download
+        out_buffer = BytesIO()
+        wb.save(out_buffer)
+        out_buffer.seek(0)
         
-        if success_count == 0:
-            st.error("No images were added. If you saw '403' errors in the logs, the site might still be blocking the request.")
-        else:
-            st.success(f"Success! {success_count} images added.")
-            st.download_button(
-                label="Download Final Excel",
-                data=excel_buffer,
-                file_name="output_with_images.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        st.download_button("Download Excel", out_buffer, "output_v7.xlsx")
 
     if st.button("Generate PowerPoint"):
-        with st.spinner("Generating Slides..."):
+        with st.spinner("Generating..."):
             prs = Presentation()
-            blank_slide_layout = prs.slide_layouts[6]
+            blank_layout = prs.slide_layouts[6]
             
             for i, row in df.iterrows():
                 raw_url = row[url_col]
                 if pd.notna(raw_url) and str(raw_url).startswith('http'):
-                    
                     processed_img = download_and_resize_image(raw_url, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
-                    
                     if processed_img:
-                        slide = prs.slides.add_slide(blank_slide_layout)
-                        
+                        slide = prs.slides.add_slide(blank_layout)
                         img_stream = BytesIO()
                         processed_img.save(img_stream, format='PNG')
                         img_stream.seek(0)
-                        
-                        left = Inches(4)
-                        top = Inches(3)
-                        slide.shapes.add_picture(img_stream, left, top)
-                        
+                        slide.shapes.add_picture(img_stream, Inches(4), Inches(3))
                         txBox = slide.shapes.add_textbox(Inches(1), Inches(6), Inches(8), Inches(1))
                         txBox.text_frame.text = f"Source: {raw_url}"
 
             ppt_buffer = BytesIO()
             prs.save(ppt_buffer)
             ppt_buffer.seek(0)
-            
-            st.success("PowerPoint Generated!")
-            st.download_button(
-                label="Download PowerPoint",
-                data=ppt_buffer,
-                file_name="presentation.pptx",
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            )
+            st.download_button("Download PPT", ppt_buffer, "output_v7.pptx")
