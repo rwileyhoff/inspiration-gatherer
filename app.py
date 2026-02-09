@@ -1,6 +1,18 @@
+"""
+VERSION 15 - MANUAL WORKAROUND
+For sites with extreme bot protection (Etsy, Next.co.uk).
+
+HOW IT WORKS:
+1. You visit the URLs manually in your browser
+2. Right-click the product image → "Copy image address"
+3. Paste the direct image URLs into a new Excel column
+4. This script uses those direct image URLs
+
+This bypasses ALL bot detection because you're using the actual CDN URLs.
+"""
+
 import streamlit as st
 import pandas as pd
-from curl_cffi import requests as cffi_requests
 from PIL import Image
 from io import BytesIO
 import openpyxl
@@ -10,222 +22,294 @@ from pptx.util import Inches
 from bs4 import BeautifulSoup
 import time
 import re
-from duckduckgo_search import DDGS
+import requests
 
 # --- CONFIGURATION ---
 TARGET_WIDTH_PX = 179
 TARGET_HEIGHT_PX = 135
 
-# --- HELPER FUNCTIONS ---
-
-def get_next_direct_cdn(url):
+def download_direct_image(image_url, width, height):
     """
-    Specifically for Next.co.uk.
-    Instead of visiting the page, we extract the Style/Item codes and 
-    guess the direct image URL from their public image server (CDN).
+    Download image from direct URL (no scraping needed)
     """
     try:
-        # Regex to find codes like 'sv068808' or 'y00128' in the URL
-        # Matches alphanumeric strings of 5-8 chars after 'style/' or '/'
-        codes = re.findall(r'(?:style/|/)([a-zA-Z0-9]{5,10})', url)
+        print(f"Downloading: {image_url[:80]}...")
         
-        # Next.co.uk image server patterns
-        # They usually store images under the "Option" code (the second code usually) 
-        # or the "Style" code (the first code). We try both.
-        base_cdn = "https://xcdn.next.co.uk/common/items/default/default/itemimages/search"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        }
         
-        session = cffi_requests.Session()
+        r = requests.get(image_url, headers=headers, timeout=20)
+        r.raise_for_status()
         
-        # We prefer the last code found (often the specific color option), then the first
-        unique_codes = list(dict.fromkeys(reversed(codes))) # Remove duplicates, preserve order
+        img = Image.open(BytesIO(r.content))
         
-        for code in unique_codes:
-            # Construct the candidate URL
-            candidate_url = f"{base_cdn}/{code}.jpg"
-            
-            try:
-                # We use a HEAD request first to see if the image exists (Fast!)
-                r = session.head(candidate_url, timeout=3)
-                if r.status_code == 200:
-                    return candidate_url
-            except:
-                pass
-                
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        
+        img = img.resize((width, height), Image.Resampling.LANCZOS)
+        
+        print(f"✅ Success")
+        return img
+        
     except Exception as e:
-        print(f"CDN Guessing failed: {e}")
-        
-    return None
-
-def fetch_image_via_search_fallback(query):
-    """
-    Last resort: Search DuckDuckGo, but strictly for 'Product Image'
-    to avoid selfies/blogs.
-    """
-    try:
-        # Extract a cleaner query ID if possible
-        clean_id = ""
-        match = re.search(r'style/([a-zA-Z0-9]+)', query)
-        if match:
-            clean_id = match.group(1)
-            search_term = f"Next UK product {clean_id}"
-        else:
-            search_term = f"{query} product image white background"
-
-        with DDGS() as ddgs:
-            results = list(ddgs.images(
-                keywords=search_term, 
-                max_results=1, 
-                safesearch='off'
-            ))
-            if results:
-                return results[0]['image']
-    except:
-        pass
-    return None
-
-def download_and_resize_image(url, width, height):
-    try:
-        clean_url = url.strip()
-        final_image_url = None
-        
-        # --- STRATEGY 1: DIRECT FILE CHECK ---
-        if clean_url.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-            final_image_url = clean_url
-
-        # --- STRATEGY 2: SPECIAL HANDLING FOR NEXT.CO.UK ---
-        if not final_image_url and "next.co.uk" in clean_url:
-            # Try to build the CDN link directly (Bypasses security entirely)
-            final_image_url = get_next_direct_cdn(clean_url)
-
-        # --- STRATEGY 3: GENERIC WEBSITES (Pottery Barn, etc.) ---
-        if not final_image_url:
-            # Try standard scraping with browser disguise
-            try:
-                session = cffi_requests.Session()
-                r = session.get(clean_url, impersonate="chrome110", timeout=10)
-                if r.status_code == 200:
-                    soup = BeautifulSoup(r.content, 'html.parser')
-                    og = soup.find("meta", property="og:image")
-                    if og and og.get("content"):
-                        final_image_url = og["content"]
-            except:
-                pass
-
-        # --- STRATEGY 4: FALLBACK SEARCH ---
-        if not final_image_url:
-            final_image_url = fetch_image_via_search_fallback(clean_url)
-
-        # --- DOWNLOAD & PROCESS ---
-        if final_image_url:
-            # Download the actual image bytes
-            r = cffi_requests.get(final_image_url, impersonate="chrome110", timeout=15)
-            r.raise_for_status()
-            
-            img = Image.open(BytesIO(r.content))
-            
-            # Convert to RGB (standardize format)
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            
-            # Resize
-            img = img.resize((width, height))
-            return img
-            
-    except Exception as e:
-        print(f"Failed to process {url}: {e}")
+        print(f"❌ Failed: {e}")
         return None
 
-# --- APP INTERFACE ---
-st.set_page_config(page_title="Excel Image Automator v7", layout="wide")
-st.title("📊 Excel & PPT Image Automator")
+def try_scrape_fallback(url):
+    """
+    Try basic scraping for other sites (not Etsy/Next)
+    """
+    try:
+        if "etsy.com" in url or "next.co.uk" in url:
+            return None  # Don't even try - they're too protected
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        r = requests.get(url, headers=headers, timeout=10)
+        
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.content, 'html.parser')
+            
+            # Try meta tags
+            for prop in ['og:image', 'twitter:image']:
+                meta = soup.find("meta", property=prop)
+                if meta and meta.get("content"):
+                    return meta["content"]
+    except:
+        pass
+    
+    return None
+
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Image Automator v15", layout="wide")
+st.title("📊 Excel & PPT Image Automator v15")
+
 st.markdown("""
-**Version 7 (CDN Bypass)**: 
-- Specifically engineered for **Next.co.uk**. 
-- It bypasses the website and pulls the official product image directly from the file server.
-- Removes the risk of getting random "Selfie" or "Blog" images.
+## 🎯 Solution for Heavily Protected Sites (Etsy, Next.co.uk)
+
+These sites have **extreme bot protection** that blocks all automated scraping. 
+
+### ✅ **Working Solution - Manual Image URLs:**
+
+**Step 1:** In your Excel, add a new column called "Image URL"
+
+**Step 2:** For each product:
+- Visit the URL in your browser
+- Right-click the main product image
+- Select **"Copy image address"** (or "Copy image URL")
+- Paste into the "Image URL" column
+
+**Step 3:** Upload your Excel and select "Image URL" as the source column
+
+---
+
+### 📋 **Example URLs to Copy:**
+
+**Etsy format:**
+```
+https://i.etsystatic.com/12345678/r/il_fullxfull.1234567890_abcd.jpg
+```
+
+**Next.co.uk format:**
+```
+https://xcdn.next.co.uk/common/items/default/default/itemimages/AltItemZoom/y00128.jpg
+```
+
+---
+
+### 🔧 **For Other Sites:**
+This tool will still try to auto-scrape sites with weaker protection (Pottery Barn, Amazon, etc.)
 """)
 
-uploaded_file = st.file_uploader("Upload your Excel Template (.xlsx)", type=['xlsx'])
+st.info("💡 **Pro Tip**: Use Excel's autofill or a browser extension like 'Image Downloader' to speed up collecting image URLs.")
+
+uploaded_file = st.file_uploader("Upload Excel Template", type=['xlsx'])
 
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
-    st.write("### Preview")
+    st.write("### Data Preview")
     st.dataframe(df.head())
-
+    
+    # Show column selection
     col1, col2 = st.columns(2)
     with col1:
-        url_col = st.selectbox("Select Column with URLs", df.columns, index=0)
+        source_col = st.selectbox(
+            "Source Column", 
+            df.columns,
+            help="Select 'Image URL' if you manually copied direct image links, or a URL column to try auto-scraping"
+        )
     with col2:
-        target_col_letter = st.text_input("Output Column Letter", value="B").upper()
-
-    st.markdown("---")
-
-    if st.button("Generate Excel"):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        target_col_letter = st.text_input("Output Column (Excel)", value="B").upper()
+    
+    # Detect if user is using direct image URLs
+    sample_value = str(df[source_col].iloc[0]) if len(df) > 0 else ""
+    is_direct_images = any(x in sample_value.lower() for x in ['.jpg', '.png', '.jpeg', 'etsystatic', 'xcdn'])
+    
+    if is_direct_images:
+        st.success("✅ Detected direct image URLs! This will work great.")
+    else:
+        st.warning("⚠️ Detected page URLs. Auto-scraping will be attempted but may fail for Etsy/Next.co.uk. Consider adding direct image URLs for 100% success.")
+    
+    if st.button("🔍 Test First 3 URLs"):
+        st.write("### Testing...")
         
-        # Load workbook
+        success_count = 0
+        for i, row in df.head(3).iterrows():
+            value = row[source_col]
+            
+            if pd.notna(value):
+                value_str = str(value).strip()
+                
+                with st.spinner(f"Testing: {value_str[:50]}..."):
+                    img = None
+                    
+                    # Check if it's a direct image URL
+                    if value_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) or 'etsystatic' in value_str or 'xcdn' in value_str:
+                        # Direct image URL
+                        img = download_direct_image(value_str, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
+                    else:
+                        # Try scraping (will fail for Etsy/Next)
+                        image_url = try_scrape_fallback(value_str)
+                        if image_url:
+                            img = download_direct_image(image_url, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
+                    
+                    if img:
+                        success_count += 1
+                        st.success(f"✅ Success")
+                        st.image(img, caption=value_str[:60], width=200)
+                    else:
+                        st.error(f"❌ Failed: {value_str[:60]}")
+                        st.info("💡 For Etsy/Next.co.uk: Right-click product image → Copy image address → Paste in Excel")
+        
+        st.info(f"**Results: {success_count}/3 successful**")
+    
+    if st.button("Generate Excel"):
+        progress = st.progress(0)
+        status = st.empty()
+        
         uploaded_file.seek(0)
         wb = openpyxl.load_workbook(uploaded_file)
         ws = wb.active
         
-        success_count = 0
-        total_rows = len(df)
+        count = 0
+        failed = []
+        total = len(df)
         
         for i, row in df.iterrows():
-            # Update Progress
-            progress_bar.progress((i + 1) / total_rows)
+            progress.progress((i + 1) / total)
+            value = row[source_col]
             
-            raw_url = row[url_col]
-            
-            if pd.notna(raw_url) and str(raw_url).startswith('http'):
-                status_text.text(f"Processing Row {i+1}...")
+            if pd.notna(value):
+                value_str = str(value).strip()
+                status.text(f"Processing {i+1}/{total}: {value_str[:40]}...")
                 
-                processed_img = download_and_resize_image(raw_url, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
+                img = None
                 
-                if processed_img:
-                    success_count += 1
-                    img_stream = BytesIO()
-                    processed_img.save(img_stream, format='PNG')
-                    img_stream.seek(0)
+                # Direct image URL
+                if value_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) or 'etsystatic' in value_str or 'xcdn' in value_str:
+                    img = download_direct_image(value_str, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
+                else:
+                    # Try scraping
+                    image_url = try_scrape_fallback(value_str)
+                    if image_url:
+                        img = download_direct_image(image_url, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
+                
+                if img:
+                    count += 1
+                    buf = BytesIO()
+                    img.save(buf, format='PNG')
+                    buf.seek(0)
+                    excel_img = OpenpyxlImage(buf)
+                    ws.add_image(excel_img, f"{target_col_letter}{i+2}")
+                    ws.row_dimensions[i+2].height = 105
+                else:
+                    failed.append(i+2)  # Row number in Excel
                     
-                    # Add to Excel
-                    excel_img = OpenpyxlImage(img_stream)
-                    excel_row = i + 2
-                    ws.add_image(excel_img, f"{target_col_letter}{excel_row}")
-                    ws.row_dimensions[excel_row].height = 105
+            time.sleep(0.5)
+        
+        if failed:
+            status.warning(f"⚠️ Complete! {count}/{total} images added. Failed rows: {', '.join(map(str, failed))}")
+        else:
+            status.success(f"✅ Complete! {count}/{total} images added")
+        
+        out = BytesIO()
+        wb.save(out)
+        out.seek(0)
+        
+        st.download_button("📥 Download Excel", out, "output_v15.xlsx",
+                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        
+        if failed:
+            st.info(f"""
+            **Failed rows:** {', '.join(map(str, failed))}
             
-            # Tiny pause
-            time.sleep(0.1)
-
-        status_text.text(f"Done! {success_count}/{total_rows} images added.")
-        
-        # Download
-        out_buffer = BytesIO()
-        wb.save(out_buffer)
-        out_buffer.seek(0)
-        
-        st.download_button("Download Excel", out_buffer, "output_v7.xlsx")
-
+            **To fix:**
+            1. Visit those URLs manually in your browser
+            2. Right-click the product image → "Copy image address"
+            3. Paste those direct image URLs into Excel
+            4. Re-run this tool
+            """)
+    
     if st.button("Generate PowerPoint"):
-        with st.spinner("Generating..."):
+        with st.spinner("Generating slides..."):
             prs = Presentation()
-            blank_layout = prs.slide_layouts[6]
+            blank = prs.slide_layouts[6]
+            count = 0
             
             for i, row in df.iterrows():
-                raw_url = row[url_col]
-                if pd.notna(raw_url) and str(raw_url).startswith('http'):
-                    processed_img = download_and_resize_image(raw_url, TARGET_WIDTH_PX, TARGET_HEIGHT_PX)
-                    if processed_img:
-                        slide = prs.slides.add_slide(blank_layout)
-                        img_stream = BytesIO()
-                        processed_img.save(img_stream, format='PNG')
-                        img_stream.seek(0)
-                        slide.shapes.add_picture(img_stream, Inches(4), Inches(3))
-                        txBox = slide.shapes.add_textbox(Inches(1), Inches(6), Inches(8), Inches(1))
-                        txBox.text_frame.text = f"Source: {raw_url}"
+                value = row[source_col]
+                
+                if pd.notna(value):
+                    value_str = str(value).strip()
+                    img = None
+                    
+                    if value_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) or 'etsystatic' in value_str or 'xcdn' in value_str:
+                        img = download_direct_image(value_str, 800, 600)
+                    else:
+                        image_url = try_scrape_fallback(value_str)
+                        if image_url:
+                            img = download_direct_image(image_url, 800, 600)
+                    
+                    if img:
+                        count += 1
+                        slide = prs.slides.add_slide(blank)
+                        buf = BytesIO()
+                        img.save(buf, format='PNG')
+                        buf.seek(0)
+                        slide.shapes.add_picture(buf, Inches(1), Inches(1), width=Inches(8))
+                        
+                        tx = slide.shapes.add_textbox(Inches(1), Inches(6.5), Inches(8), Inches(0.5))
+                        tx.text_frame.text = f"Source: {value_str}"
+            
+            out = BytesIO()
+            prs.save(out)
+            out.seek(0)
+            st.download_button("📥 Download PowerPoint", out, "output_v15.pptx",
+                              mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+            st.success(f"✅ Created {count} slides")
 
-            ppt_buffer = BytesIO()
-            prs.save(ppt_buffer)
-            ppt_buffer.seek(0)
-            st.download_button("Download PPT", ppt_buffer, "output_v7.pptx")
+st.markdown("---")
+st.markdown("""
+### 📖 **Quick Guide: How to Copy Image URLs**
+
+**Chrome/Edge:**
+1. Go to product page
+2. Right-click main image
+3. Select "Copy image address"
+
+**Firefox:**
+1. Go to product page
+2. Right-click main image
+3. Select "Copy Image Link"
+
+**Safari:**
+1. Go to product page
+2. Right-click main image
+3. Select "Copy Image Address"
+
+Paste these URLs directly into your Excel sheet!
+""")
